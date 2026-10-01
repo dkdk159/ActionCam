@@ -113,6 +113,7 @@ final class VoiceCommandManager {
     private var useOnDevice = true
     private var lastStart = Date.distantPast
     private var lastStop = Date.distantPast
+    private var lastHeardLog = Date.distantPast
 
     func setWords(start: [String], stop: [String]) {
         if !start.isEmpty { startWords = start }
@@ -124,8 +125,9 @@ final class VoiceCommandManager {
         guard !busy else { return }
         SFSpeechRecognizer.requestAuthorization { [weak self] st in
             guard let self = self else { return }
+            Log.write("[语音] 授权状态 \(st.rawValue)")
             guard st == .authorized else {
-                Log.write("[语音] 未授权 st=\(st.rawValue)")
+                Log.write("[语音] 未授权，请到 设置-隐私-语音识别 打开")
                 return
             }
             DispatchQueue.main.async { self.begin() }
@@ -168,6 +170,10 @@ final class VoiceCommandManager {
             guard let self = self else { return }
             if let result = result {
                 let text = result.bestTranscription.formattedString
+                if !text.isEmpty, Date().timeIntervalSince(self.lastHeardLog) > 1.5 {
+                    self.lastHeardLog = Date()
+                    Log.write("[语音] 听到: \(text)")
+                }
                 self.handle(text)
                 if result.isFinal {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.restart() }
@@ -178,6 +184,7 @@ final class VoiceCommandManager {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.restart() }
             }
         }
+        Log.write("[语音] 监听已启动 离线=\(supportsOffline && useOnDevice)")
     }
 
     private func restart() {
@@ -316,6 +323,7 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var showLog = false
     @Published var logText = ""
     @Published var encodedFrameCount = 0
+    @Published var receivedFrameCount = 0
     @Published var bufferedFrameCount = 0
 
     // 设置
@@ -357,6 +365,13 @@ final class CameraEngine: NSObject, ObservableObject {
     private var fileSequence = 0
     private var configured = false
 
+    // 看门狗用的时间戳
+    private var lastVideoFrameAt: Date?
+    private var lastEncodeOutputAt = Date.distantPast
+    private var lastEncoderAttempt = Date.distantPast
+    private var lastCaptureRecovery = Date.distantPast
+    private var lastEncoderRecovery = Date.distantPast
+
     // 跨线程状态
     private let stateLock = NSLock()
     private var _recording = false
@@ -378,9 +393,14 @@ final class CameraEngine: NSObject, ObservableObject {
     // MARK: 生命周期
     func prepare() {
         let audioSession = AVAudioSession.sharedInstance()
-        try? audioSession.setCategory(.playAndRecord, mode: .default,
-                                      options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
-        try? audioSession.setActive(true)
+        do {
+            try audioSession.setCategory(.playAndRecord, mode: .default,
+                                         options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
+            try audioSession.setActive(true)
+            Log.write("[音频] 会话就绪")
+        } catch {
+            Log.write("[音频] 会话失败 \(error.localizedDescription)")
+        }
 
         motion.start()
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
@@ -388,9 +408,11 @@ final class CameraEngine: NSObject, ObservableObject {
         infoTimer?.invalidate()
         infoTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
+            self.runWatchdogs()
             guard self.debugInfo || self.showLog else { return }
             let info = "编码:\(self.encodedFrameCount) 缓冲:\(self.videoRing?.count ?? 0) "
-                + "录制:\(self.isRecording ? "Y" : "N") 写入:\(self._live ? "live" : (self._starting ? "starting" : "-"))"
+                + "帧:\(self.receivedFrameCount) 录制:\(self.isRecording ? "Y" : "N") "
+                + "写入:\(self._live ? "live" : (self._starting ? "starting" : "-"))"
             self.logText = info + "\n" + LogBuffer.text()
         }
 
@@ -404,7 +426,8 @@ final class CameraEngine: NSObject, ObservableObject {
         }
         voice.onStart = { [weak self] in
             guard let self = self else { return }
-            if !self.recordingFlag { self.startRecording() }
+            Log.write("[语音] 收到开始指令")
+            if !self.recordingFlag { self.startRecording() } else { Log.write("[语音] 已在录制，忽略") }
         }
         voice.onStop = { [weak self] in
             guard let self = self else { return }
@@ -412,6 +435,51 @@ final class CameraEngine: NSObject, ObservableObject {
         }
 
         sessionQueue.async { [weak self] in self?.configureSession() }
+    }
+
+    /// 双看门狗：画面停了救采集，画面在动却没编码输出就重建编码器
+    private func runWatchdogs() {
+        let now = Date()
+
+        // 1) 采集看门狗：2.5 秒没有视频帧 → 数据输出链路可能被断开，重挂
+        if let last = lastVideoFrameAt, now.timeIntervalSince(last) > 2.5 {
+            if now.timeIntervalSince(lastCaptureRecovery) > 5 {
+                lastCaptureRecovery = now
+                Log.write("[看门狗] 2.5秒无画面，重挂数据输出")
+                recoverCapture()
+            }
+        }
+
+        // 2) 编码看门狗：有画面进来，但 3 秒没有任何编码输出 → 编码器异常，重建
+        if let last = lastVideoFrameAt, now.timeIntervalSince(last) < 1.5,
+           now.timeIntervalSince(lastEncodeOutputAt) > 3 {
+            if now.timeIntervalSince(lastEncoderRecovery) > 3 {
+                lastEncoderRecovery = now
+                Log.write("[看门狗] 3秒无编码输出，重建编码器")
+                // 放到采集队列上做，避免与正在进行的编码并发操作 VTCompressionSession
+                sessionQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    self.encoder.invalidate()
+                    self.encoderSize = .zero
+                    self.lastEncoderAttempt = .distantPast
+                    self.lastKeyPTS = .invalid
+                }
+            }
+        }
+    }
+
+    private func recoverCapture() {
+        sessionQueue.async { [weak self] in
+            guard let self = self else { return }
+            if !self.session.isRunning { self.session.startRunning() }
+            self.session.beginConfiguration()
+            self.session.removeOutput(self.videoOutput)
+            if self.session.canAddOutput(self.videoOutput) { self.session.addOutput(self.videoOutput) }
+            self.session.commitConfiguration()
+            self.videoOutput.setSampleBufferDelegate(self, queue: self.sessionQueue)
+            self.attachConnectionsLocked()
+            Log.write("[看门狗] 数据输出已重挂 running=\(self.session.isRunning)")
+        }
     }
 
     private func configureSession() {
@@ -441,12 +509,12 @@ final class CameraEngine: NSObject, ObservableObject {
         audioOutput.setSampleBufferDelegate(self, queue: sessionQueue)
         if session.canAddOutput(audioOutput) { session.addOutput(audioOutput) }
 
-        applyOrientationLocked()
-        applyStabilizationLocked()
         session.commitConfiguration()
+        attachConnectionsLocked()
         applyFrameRateLocked()
         rebuildBuffers()
         session.startRunning()
+        attachConnectionsLocked()
         Log.write("[会话] 启动 \(resolution.rawValue) \(lens.rawValue)")
     }
 
@@ -486,12 +554,12 @@ final class CameraEngine: NSObject, ObservableObject {
             } else if let old = self.videoInput {
                 self.session.addInput(old)
             }
-            self.applyOrientationLocked()
-            self.applyStabilizationLocked()
             self.session.commitConfiguration()
+            self.attachConnectionsLocked()
             self.videoRing?.removeAll()
             self.audioRing?.removeAll()
             self.encoderSize = .zero
+            self.lastKeyPTS = .invalid
             DispatchQueue.main.async { self.torchOn = false }
             Log.write("[镜头] 切换 \(self.lens.rawValue)")
         }
@@ -509,10 +577,12 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.session.sessionPreset = self.resolution.preset
             }
             self.session.commitConfiguration()
+            self.attachConnectionsLocked()
             self.applyFrameRateLocked()
             self.videoRing?.removeAll()
             self.audioRing?.removeAll()
             self.encoderSize = .zero
+            self.lastKeyPTS = .invalid
             Log.write("[会话] 分辨率 \(self.resolution.rawValue)")
         }
     }
@@ -541,23 +611,28 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
-    func applyStabilization() { sessionQueue.async { [weak self] in self?.applyStabilizationLocked() } }
+    func applyStabilization() { sessionQueue.async { [weak self] in self?.attachConnectionsLocked() } }
 
-    private func applyStabilizationLocked() {
-        guard let connection = videoOutput.connection(with: .video) else { return }
-        if connection.isVideoStabilizationSupported {
-            connection.preferredVideoStabilizationMode = stabilization.mode
+    func applyOrientation() { sessionQueue.async { [weak self] in self?.attachConnectionsLocked() } }
+
+    /// 重新挂好输出连接。
+    /// 关键！每次 beginConfiguration/commitConfiguration 之后，AVCaptureVideoDataOutput 的
+    /// connection 可能被系统置为 isEnabled = false（预览层是另一条链路，所以预览照常、数据却不再回调）。
+    /// 这就是"编码器突然停住、预录缓冲永远是 0"的根因，必须显式恢复。
+    private func attachConnectionsLocked() {
+        if let connection = videoOutput.connection(with: .video) {
+            if !connection.isEnabled { connection.isEnabled = true }
+            if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
+            if connection.isVideoMirroringSupported {
+                connection.automaticallyAdjustsVideoMirroring = false
+                connection.isVideoMirrored = (lens == .front) ? !mirrorRear : mirrorRear
+            }
+            if connection.isVideoStabilizationSupported {
+                connection.preferredVideoStabilizationMode = stabilization.mode
+            }
         }
-    }
-
-    func applyOrientation() { sessionQueue.async { [weak self] in self?.applyOrientationLocked() } }
-
-    private func applyOrientationLocked() {
-        guard let connection = videoOutput.connection(with: .video) else { return }
-        if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
-        if connection.isVideoMirroringSupported {
-            connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = (lens == .front) ? !mirrorRear : mirrorRear
+        if let audioConnection = audioOutput.connection(with: .audio) {
+            if !audioConnection.isEnabled { audioConnection.isEnabled = true }
         }
     }
 
@@ -596,7 +671,9 @@ final class CameraEngine: NSObject, ObservableObject {
             guard let self = self else { return }
             guard self.recordingFlag else { return }
             if self.preRecordEnabled {
-                let window = Self.trimToFirstSync(self.videoRing?.snapshot() ?? [])
+                let all = self.videoRing?.snapshot() ?? []
+                let window = Self.trimToFirstSync(all)
+                Log.write("[录制] 缓冲\(all.count)帧 关键帧窗口\(window.count)帧")
                 if window.isEmpty {
                     self.markPendingStart()
                     Log.write("[录制] 缓冲内暂无关键帧，等待下一帧关键帧")
@@ -658,13 +735,17 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 
     private func handleEncoded(_ sample: CMSampleBuffer) {
+        lastEncodeOutputAt = Date()
         encodedFrameCount &+= 1
         let needRing = preRecordFlag
         let needStart = pendingStartFlag
         let needWrite = recordingFlag
         guard needRing || needStart || needWrite else { return }
         // 关键：深拷贝成独立内存，否则回调返回后就是悬垂指针
-        guard let frame = sample.deepCopy() else { return }
+        guard let frame = sample.deepCopy() else {
+            Log.write("[编码] 深拷贝失败，丢弃一帧")
+            return
+        }
         if needRing { videoRing?.append(frame) }
 
         if needStart {
@@ -674,7 +755,7 @@ final class CameraEngine: NSObject, ObservableObject {
             let audios = (audioRing?.snapshot() ?? []).filter {
                 CMTimeCompare(samplePTS($0), startTime) >= 0
             }
-            Log.write("[录制] 关键帧到达，启动写入")
+            Log.write("[录制] 拿到起始关键帧，启动写入 音频=\(audios.count)")
             launchWriter(video: [frame], audio: audios)
             return
         }
@@ -844,17 +925,19 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
     }
 
     private func handleVideo(_ sample: CMSampleBuffer) {
+        lastVideoFrameAt = Date()
+        receivedFrameCount &+= 1
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { return }
         let w = CVPixelBufferGetWidth(pixelBuffer)
         let h = CVPixelBufferGetHeight(pixelBuffer)
 
-        if encoderSize != CGSize(width: w, height: h) {
+        let sizeChanged = encoderSize != CGSize(width: w, height: h)
+        if sizeChanged {
             encoderSize = CGSize(width: w, height: h)
             videoRing?.removeAll()
             audioRing?.removeAll()
             lastKeyPTS = .invalid
-            let bitrate = max(w * h * 3, 6_000_000)
-            encoder.configure(width: w, height: h, fps: frameRate.rawValue, bitrate: bitrate)
+            encoder.invalidate()
             if recordingFlag {
                 Log.write("[采集] 录制中画面尺寸变化，停止录制")
                 DispatchQueue.main.async { self.stopRecording() }
@@ -862,10 +945,27 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
             }
         }
 
+        // 只在需要时编码（省电省发热）：预录开启 / 正在录制 / 等待起始关键帧
+        let needEncode = preRecordEnabled || recordingFlag || pendingStartFlag
+        guard needEncode else { return }
+
+        // 编码器缺失（创建失败或被系统回收）时自动重建，最多 1 秒重试一次
+        if sizeChanged || !encoder.isReady {
+            let now = Date()
+            if sizeChanged || now.timeIntervalSince(lastEncoderAttempt) > 1.0 {
+                lastEncoderAttempt = now
+                let bitrate = max(w * h * 3, 6_000_000)
+                encoder.configure(width: w, height: h, fps: frameRate.rawValue, bitrate: bitrate)
+            }
+        }
+        guard encoder.isReady else { return }
+
         let pts = samplePTS(sample)
         var forceKey = false
         if pendingStartFlag {
+            // 需要立刻拿到一个关键帧作为写入起点
             forceKey = true
+            lastKeyPTS = .invalid
         } else if !lastKeyPTS.isValid || CMTimeGetSeconds(CMTimeSubtract(pts, lastKeyPTS)) >= 1.0 {
             forceKey = true
             lastKeyPTS = pts
@@ -875,8 +975,7 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
 
     private func handleAudio(_ sample: CMSampleBuffer) {
         if voiceFlag { voice.feed(sample) }
-        let needRing = preRecordFlag || recordingFlag || pendingStartFlag
-        guard needRing else { return }
+        // 音频环形缓冲始终维护：既为预录提供音频，也为写入器提供格式提示
         guard let copy = sample.deepCopy() else { return }
         audioRing?.append(copy)
         if recordingFlag { writer.appendAudio(copy) }

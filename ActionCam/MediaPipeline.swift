@@ -11,7 +11,7 @@ enum LogBuffer {
     static func add(_ s: String) {
         lock.lock()
         lines.append(s)
-        if lines.count > 9 { lines.removeFirst(lines.count - 9) }
+        if lines.count > 40 { lines.removeFirst(lines.count - 40) }
         lock.unlock()
     }
     static func text() -> String {
@@ -138,6 +138,12 @@ final class H264Encoder {
     private var configuredSize = CGSize.zero
     private let lock = NSLock()
     var onSample: ((CMSampleBuffer) -> Void)?
+
+    /// 编码器是否可用（创建失败或被系统回收后会变 false，由引擎重试重建）
+    var isReady: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return session != nil
+    }
 
     func configure(width: Int, height: Int, fps: Int, bitrate: Int) {
         lock.lock(); defer { lock.unlock() }

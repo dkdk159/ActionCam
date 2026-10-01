@@ -31,24 +31,23 @@ jobs:
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGNING_ALLOWED=NO \
           ONLY_ACTIVE_ARCH=NO \
-          build 2>&1 | tee build.log | tail -n 120
+          build 2>&1 | tee build.log | tail -n 150
 
-    - name: Show errors if failed
+    - name: Print compile errors
       if: failure()
-      run: grep -n -E "error:|warning: .*deprecat" build.log | head -n 80 || true
+      run: |
+        grep -n "error:" build.log | head -n 80 || true
 
     - name: Package IPA
       run: |
         APP_PATH=$(find . -name "ActionCam.app" -path "*Debug-iphoneos*" | head -1)
         echo "App: $APP_PATH"
-        if [ -n "$APP_PATH" ]; then
-          mkdir -p output/Payload
-          cp -R "$APP_PATH" output/Payload/
-          cd output
-          zip -q -r ActionCam.ipa Payload
-          cd ..
-          ls -la output
-        fi
+        mkdir -p output/Payload
+        cp -R "$APP_PATH" output/Payload/
+        cd output
+        zip -q -r ActionCam.ipa Payload
+        cd ..
+        ls -la output
 
     - name: Upload IPA
       uses: actions/upload-artifact@v4
